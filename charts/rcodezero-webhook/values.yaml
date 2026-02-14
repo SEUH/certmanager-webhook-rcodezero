@@ -44,6 +44,13 @@ tolerations: []
 
 affinity: {}
 
+## @section Certificate
+
+certificates:
+  privateKey:
+    # -- Explicitly set cert-manager private key rotation policy to avoid version-dependent defaults.
+    rotationPolicy: Never
+
 ## @section Security Contexts
 
 containerSecurityContext:
@@ -53,6 +60,12 @@ containerSecurityContext:
   ## @param containerSecurityContext.runAsNonRoot Whether to run the container as a non-root user
   ##
   runAsNonRoot: true
+  ## @param containerSecurityContext.runAsUser Numeric user ID to run the container as
+  ##
+  runAsUser: 65532
+  ## @param containerSecurityContext.runAsGroup Numeric group ID to run the container as
+  ##
+  runAsGroup: 65532
   ## @param containerSecurityContext.privileged Whether the container is privileged
   ##
   privileged: false

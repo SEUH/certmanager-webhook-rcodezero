@@ -30,6 +30,8 @@ metadata:
 spec:
   secretName: {{ include "certmanager-webhook-rcodezero.rootCACertificate" . }}
   duration: 43800h # 5y
+  privateKey:
+    rotationPolicy: {{ .Values.certificates.privateKey.rotationPolicy }}
   issuerRef:
     name: {{ include "certmanager-webhook-rcodezero.selfSignedIssuer" . }}
   commonName: "ca.certmanager-webhook-rcodezero.cert-manager"
@@ -68,6 +70,8 @@ metadata:
 spec:
   secretName: {{ include "certmanager-webhook-rcodezero.servingCertificate" . }}
   duration: 8760h # 1y
+  privateKey:
+    rotationPolicy: {{ .Values.certificates.privateKey.rotationPolicy }}
   issuerRef:
     name: {{ include "certmanager-webhook-rcodezero.rootCAIssuer" . }}
   dnsNames:
