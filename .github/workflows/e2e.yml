@@ -1,0 +1,159 @@
+name: E2E DNS01
+
+# Issues a Let's Encrypt *staging* certificate through the webhook against a
+# real RcodeZero zone, using the newest cert-manager release on the newest
+# Kubernetes version that kind supports.
+#
+# Configure a GitHub Environment named "e2e" with:
+#   secret   RCODEZERO_TOKEN  RcodeZero API token with the "acme" permission
+#   variable TEST_ZONE        fixed test zone, e.g. "e2e.example.at"
+#                             (may also be stored as a secret named TEST_ZONE)
+
+on:
+  push:
+    branches: [ "main" ]
+  schedule:
+    - cron: "0 5 * * 1"   # Mondays 05:00 UTC, catches RcodeZero API or token problems
+  workflow_dispatch:
+
+# All runs share one zone: never run two at once, and never cancel a run
+# mid-challenge (that could leave _acme-challenge records behind).
+concurrency:
+  group: e2e-dns01-rcodezero
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NAMESPACE: cert-manager
+  GROUP_NAME: acme.rcodezero.at
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    environment: e2e
+    timeout-minutes: 20
+    env:
+      RCODEZERO_TOKEN: ${{ secrets.RCODEZERO_TOKEN }}
+      TEST_ZONE: ${{ vars.TEST_ZONE || secrets.TEST_ZONE }}
+    steps:
+      - name: Check configuration
+        run: |
+          [ -n "$RCODEZERO_TOKEN" ] || { echo "::error::secret RCODEZERO_TOKEN is not set in environment 'e2e'"; exit 1; }
+          [ -n "$TEST_ZONE" ]       || { echo "::error::variable/secret TEST_ZONE is not set in environment 'e2e'"; exit 1; }
+          # GitHub only masks the literal secret; also mask its base64 form (as stored in Kubernetes Secrets).
+          echo "::add-mask::$(printf %s "$RCODEZERO_TOKEN" | base64 -w0)"
+          zone="${TEST_ZONE%.}"
+          echo "DNS_NAME=e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.${zone}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Resolve versions
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/resolve-compat-matrix.sh
+
+      - name: Pick newest versions
+        id: pick
+        env:
+          CERT_MANAGER: ${{ steps.resolve.outputs.cert_manager }}
+          NODES: ${{ steps.resolve.outputs.nodes }}
+        run: |
+          # cert_manager is sorted oldest to newest, nodes newest to oldest
+          echo "cert_manager=$(jq -r 'last' <<<"$CERT_MANAGER")" >> "$GITHUB_OUTPUT"
+          echo "node_image=$(jq -r 'first.image' <<<"$NODES")" >> "$GITHUB_OUTPUT"
+          echo "Testing cert-manager $(jq -r 'last' <<<"$CERT_MANAGER") on Kubernetes $(jq -r 'first.k8s' <<<"$NODES")"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          version: ${{ steps.resolve.outputs.kind_version }}
+          node_image: ${{ steps.pick.outputs.node_image }}
+
+      - name: Install cert-manager
+        run: |
+          helm install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+            --version "${{ steps.pick.outputs.cert_manager }}" \
+            -n "$NAMESPACE" --create-namespace \
+            --set crds.enabled=true \
+            --set 'extraArgs={--dns01-recursive-nameservers-only,--dns01-recursive-nameservers=1.1.1.1:53\,8.8.8.8:53}' \
+            --wait
+
+      - name: Build and load webhook image
+        run: |
+          docker build -t webhook:e2e .
+          kind load docker-image webhook:e2e --name chart-testing
+
+      - name: Install webhook chart
+        run: |
+          helm install rcodezero-webhook charts/rcodezero-webhook \
+            -n "$NAMESPACE" \
+            --set groupName="$GROUP_NAME" \
+            --set image.repository=webhook \
+            --set image.tag=e2e \
+            --set image.pullPolicy=Never \
+            --wait
+          kubectl wait --for=condition=Available "apiservice/v1alpha1.${GROUP_NAME}" --timeout=3m
+
+      - name: Create issuer and certificate
+        run: |
+          kubectl -n "$NAMESPACE" create secret generic rcodezero-api-token \
+            --from-literal=token="$RCODEZERO_TOKEN"
+
+          cat <<EOF | kubectl -n "$NAMESPACE" apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: Issuer
+          metadata:
+            name: letsencrypt-staging
+          spec:
+            acme:
+              server: https://acme-staging-v02.api.letsencrypt.org/directory
+              privateKeySecretRef:
+                name: letsencrypt-staging-account-key
+              solvers:
+                - dns01:
+                    webhook:
+                      groupName: ${GROUP_NAME}
+                      solverName: rcodezero
+                      config:
+                        apiKeySecretRef:
+                          name: rcodezero-api-token
+                          key: token
+          ---
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: e2e
+          spec:
+            secretName: e2e-tls
+            dnsNames:
+              - ${DNS_NAME}
+            issuerRef:
+              name: letsencrypt-staging
+              kind: Issuer
+          EOF
+
+      - name: Wait for certificate
+        run: kubectl -n "$NAMESPACE" wait certificate/e2e --for=condition=Ready --timeout=10m
+
+      - name: Debug output
+        if: failure()
+        run: |
+          kubectl -n "$NAMESPACE" get pods,issuers,certificates,certificaterequests,orders,challenges -o wide || true
+          kubectl -n "$NAMESPACE" describe challenges || true
+          kubectl -n "$NAMESPACE" logs deploy/rcodezero-webhook-certmanager-webhook-rcodezero --tail=200 || true
+          kubectl -n "$NAMESPACE" logs deploy/cert-manager --tail=200 || true
+
+      # Deleting the certificate makes cert-manager call CleanUp for any open
+      # challenge, so no _acme-challenge TXT records are left in the zone.
+      - name: Clean up DNS records
+        if: always()
+        run: |
+          kubectl -n "$NAMESPACE" delete certificate e2e --ignore-not-found --wait=true || true
+          kubectl -n "$NAMESPACE" wait challenges --all --for=delete --timeout=3m || true
