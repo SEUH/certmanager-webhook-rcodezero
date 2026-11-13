@@ -131,7 +131,7 @@ func (c *RcodeZeroDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) erro
 	provider, _, err := c.init(ch.Config, ch.ResourceNamespace)
 	if err != nil {
 		klog.Errorf("failed initializing rcodezero provider: %v", err)
-		return nil
+		return err
 	}
 
 	rrSet := []UpdateRRSet{{
@@ -170,7 +170,7 @@ func (c *RcodeZeroDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) erro
 	provider, _, err := c.init(ch.Config, ch.ResourceNamespace)
 	if err != nil {
 		klog.Errorf("failed initializing rcodezero provider: %v", err)
-		return nil
+		return err
 	}
 
 	rrSet := []UpdateRRSet{{
@@ -234,6 +234,15 @@ func (c *RcodeZeroDNSProviderSolver) init(config *extapi.JSON, namespace string)
 	cfg, err := loadConfig(config)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed parsing provider config: %v", err)
+	}
+	if cfg.APIKeySecretRef == nil {
+		return nil, cfg, fmt.Errorf("apiKeySecretRef must be set")
+	}
+	if cfg.APIKeySecretRef.LocalObjectReference.Name == "" {
+		return nil, cfg, fmt.Errorf("apiKeySecretRef.name must be set")
+	}
+	if cfg.APIKeySecretRef.Key == "" {
+		return nil, cfg, fmt.Errorf("apiKeySecretRef.key must be set")
 	}
 
 	// Load the API key secret

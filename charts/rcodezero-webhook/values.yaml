@@ -44,6 +44,13 @@ tolerations: []
 
 affinity: {}
 
+## @section Certificate
+
+certificates:
+  privateKey:
+    # -- Explicitly set cert-manager private key rotation policy to avoid version-dependent defaults.
+    rotationPolicy: Never
+
 ## @section Security Contexts
 
 containerSecurityContext:

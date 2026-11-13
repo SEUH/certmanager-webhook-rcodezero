@@ -15,9 +15,10 @@ COPY . .
 
 RUN CGO_ENABLED=0 go build -o webhook -ldflags '-w -extldflags "-static"' .
 
-FROM scratch
+FROM gcr.io/distroless/static:nonroot
 
 COPY --from=build /workspace/webhook /usr/local/bin/webhook
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
-ENTRYPOINT ["webhook"]
+USER 65532:65532
+
+ENTRYPOINT ["/usr/local/bin/webhook"]
