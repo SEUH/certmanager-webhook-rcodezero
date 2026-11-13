@@ -1,0 +1,151 @@
+name: Compatibility
+
+# Installs the webhook chart on every combination of
+#   - the two newest cert-manager minor releases (latest patch each)
+#   - all Kubernetes minor releases currently supported upstream
+# and checks that it comes up and serves its API. No secrets, no DNS calls.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: "0 4 * * 1"   # Mondays 04:00 UTC, catches new cert-manager/Kubernetes releases
+  workflow_dispatch:
+
+concurrency:
+  group: compat-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NAMESPACE: cert-manager
+  GROUP_NAME: acme.rcodezero.at
+  RELEASE: rcodezero-webhook
+
+jobs:
+  resolve:
+    name: Resolve versions
+    runs-on: ubuntu-latest
+    outputs:
+      cert_manager: ${{ steps.resolve.outputs.cert_manager }}
+      kind_version: ${{ steps.resolve.outputs.kind_version }}
+      nodes: ${{ steps.resolve.outputs.nodes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Resolve matrix
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/resolve-compat-matrix.sh
+
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Build image
+        run: |
+          docker build -t webhook:compat .
+          docker save webhook:compat -o webhook.tar
+
+      - name: Upload image
+        uses: actions/upload-artifact@v4
+        with:
+          name: webhook-image
+          path: webhook.tar
+          retention-days: 1
+
+  install:
+    name: cert-manager ${{ matrix.cert_manager }} / k8s ${{ matrix.node.k8s }}
+    needs: [ resolve, build ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cert_manager: ${{ fromJSON(needs.resolve.outputs.cert_manager) }}
+        node: ${{ fromJSON(needs.resolve.outputs.nodes) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          version: ${{ needs.resolve.outputs.kind_version }}
+          node_image: ${{ matrix.node.image }}
+          cluster_name: compat
+
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with:
+          name: webhook-image
+
+      - name: Load image into kind
+        run: |
+          docker load -i webhook.tar
+          kind load docker-image webhook:compat --name compat
+
+      - name: Install cert-manager
+        run: |
+          helm install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+            --version "${{ matrix.cert_manager }}" \
+            -n "$NAMESPACE" --create-namespace \
+            --set crds.enabled=true \
+            --wait --timeout 5m
+
+      - name: Install webhook chart
+        run: |
+          helm install "$RELEASE" charts/rcodezero-webhook \
+            -n "$NAMESPACE" \
+            --set groupName="$GROUP_NAME" \
+            --set image.repository=webhook \
+            --set image.tag=compat \
+            --set image.pullPolicy=Never \
+            --wait --timeout 5m
+
+      - name: Check webhook PKI certificates
+        run: |
+          kubectl -n "$NAMESPACE" wait certificate --all --for=condition=Ready --timeout=3m
+          for c in $(kubectl -n "$NAMESPACE" get certificate -o name); do
+            policy=$(kubectl -n "$NAMESPACE" get "$c" -o jsonpath='{.spec.privateKey.rotationPolicy}')
+            echo "$c rotationPolicy=$policy"
+            [ "$policy" = "Never" ] || { echo "::error::$c has rotationPolicy '$policy', expected 'Never'"; exit 1; }
+          done
+
+      - name: Check webhook API is served
+        run: |
+          kubectl wait --for=condition=Available "apiservice/v1alpha1.${GROUP_NAME}" --timeout=3m
+          kubectl get --raw "/apis/${GROUP_NAME}/v1alpha1" \
+            | jq -e '.resources[] | select(.name == "rcodezero")' >/dev/null \
+            || { echo "::error::solver 'rcodezero' not listed under /apis/${GROUP_NAME}/v1alpha1"; exit 1; }
+
+      - name: Check webhook runs as non-root
+        run: |
+          nonroot=$(kubectl -n "$NAMESPACE" get pod -l "app=certmanager-webhook-rcodezero" \
+            -o jsonpath='{.items[0].spec.containers[0].securityContext.runAsNonRoot}')
+          ready=$(kubectl -n "$NAMESPACE" get pod -l "app=certmanager-webhook-rcodezero" \
+            -o jsonpath='{.items[0].status.containerStatuses[0].ready}')
+          echo "runAsNonRoot=$nonroot ready=$ready"
+          [ "$nonroot" = "true" ] && [ "$ready" = "true" ]
+
+      - name: Debug output
+        if: failure()
+        run: |
+          kubectl get nodes -o wide || true
+          kubectl -n "$NAMESPACE" get pods,certificates,issuers -o wide || true
+          kubectl get apiservice "v1alpha1.${GROUP_NAME}" -o yaml || true
+          kubectl -n "$NAMESPACE" describe pods -l "app=certmanager-webhook-rcodezero" || true
+          kubectl -n "$NAMESPACE" logs -l "app=certmanager-webhook-rcodezero" --tail=200 || true
+          kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp | tail -50 || true
